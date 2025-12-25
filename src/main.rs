@@ -7,7 +7,6 @@ extern crate alloc;
 unsafe extern "C" {}
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_void};
 use wasmparser::{BinaryReaderError, Parser, Payload, ValType};
@@ -17,10 +16,10 @@ struct LibcAllocator;
 
 unsafe impl core::alloc::GlobalAlloc for LibcAllocator {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        libc::malloc(layout.size()) as *mut u8
+        unsafe { libc::malloc(layout.size()) as *mut u8 }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
-        libc::free(ptr as *mut c_void);
+        unsafe { libc::free(ptr as *mut c_void); }
     }
     unsafe fn realloc(&self, ptr: *mut u8, _layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
         unsafe { libc::realloc(ptr as *mut c_void, new_size) as *mut u8 }
@@ -36,20 +35,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         let msg = b"panic!\n";
         libc::write(2, msg.as_ptr() as *const c_void, msg.len());
         
-        // Try to print panic message if available
-        if let Some(s) = info.payload().downcast_ref::<&str>() {
-            let bytes = s.as_bytes();
-            libc::write(2, bytes.as_ptr() as *const c_void, bytes.len());
-            libc::write(2, b"\n".as_ptr() as *const c_void, 1);
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            let bytes = s.as_bytes();
-            libc::write(2, bytes.as_ptr() as *const c_void, bytes.len());
-            libc::write(2, b"\n".as_ptr() as *const c_void, 1);
-        }
-        
         // Try to print location if available
         if let Some(location) = info.location() {
-            let loc_msg = format!(" at {}:{}:{}\n", location.file(), location.line(), location.column());
+            let loc_msg = alloc::format!(" at {}:{}:{}\n", location.file(), location.line(), location.column());
             let bytes = loc_msg.as_bytes();
             libc::write(2, bytes.as_ptr() as *const c_void, bytes.len());
         }
@@ -662,9 +650,7 @@ fn read_file(path: *const c_char) -> Option<Vec<u8>> {
 
         let size = stat.st_size as usize;
         let mut buf = Vec::with_capacity(size);
-        unsafe {
-            buf.set_len(size);
-        }
+        buf.set_len(size);
 
         let n = libc::read(fd, buf.as_mut_ptr() as *mut c_void, size);
         libc::close(fd);
