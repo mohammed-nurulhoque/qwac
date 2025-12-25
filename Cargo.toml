@@ -1,11 +1,14 @@
 [package]
-name = "wars"
+name = "qwac"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 wasmparser = { version = "0.243.0", default-features = false }
 libc = "0.2"
+
+[profile.dev]
+panic = "abort"
 
 [profile.release]
 opt-level = "z"
