@@ -17,6 +17,8 @@ pub trait Architecture {
     fn emit_sub(&mut self, dst: Register, src1: Register, src2: Register);
     fn emit_slt(&mut self, dst: Register, src1: Register, src2: Register);
     fn emit_slti(&mut self, dst: Register, src: Register, imm: i32);
+    fn emit_sltu(&mut self, dst: Register, src1: Register, src2: Register);
+    fn emit_sltiu(&mut self, dst: Register, src: Register, imm: i32);
     fn emit_xori(&mut self, dst: Register, src: Register, imm: i32);
     fn emit_bnez(&mut self, reg: Register, label: u32);
     fn emit_beqz(&mut self, reg: Register, label: u32);
@@ -25,6 +27,8 @@ pub trait Architecture {
     fn emit_bne(&mut self, reg1: Register, reg2: Register, label: &str);
     fn emit_blt(&mut self, reg1: Register, reg2: Register, label: &str);
     fn emit_bge(&mut self, reg1: Register, reg2: Register, label: &str);
+    fn emit_bltu(&mut self, reg1: Register, reg2: Register, label: &str);
+    fn emit_bgeu(&mut self, reg1: Register, reg2: Register, label: &str);
     fn emit_jump(&mut self, label: u32);
     fn emit_return(&mut self);
     
@@ -34,7 +38,16 @@ pub trait Architecture {
     // Materialization helpers
     fn materialize_add(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
     fn materialize_sub(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_eq(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_ne(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_lt_s(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
     fn materialize_le_s(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_gt_s(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_ge_s(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_lt_u(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_le_u(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_gt_u(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
+    fn materialize_ge_u(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
     fn materialize_store_local(&mut self, local_idx: u32, loc: &Location);
     
     // Conditional branch: emit appropriate branch based on condition node

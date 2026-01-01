@@ -42,8 +42,16 @@ pub enum Location {
 enum Node {
     OpAddI32(Location, Location),
     OpSubI32(Location, Location),
+    OpEqI32(Location, Location),
+    OpNeI32(Location, Location),
+    OpLtSI32(Location, Location),
     OpLeSI32(Location, Location),
     OpGtSI32(Location, Location),
+    OpGeSI32(Location, Location),
+    OpLtUI32(Location, Location),
+    OpLeUI32(Location, Location),
+    OpGtUI32(Location, Location),
+    OpGeUI32(Location, Location),
     ConstI32(i32),
     CopyFrom(Location),
     Local(u32), // Local variable index (doesn't become free when used)
@@ -311,10 +319,64 @@ impl<A: arch::Architecture> CompilerState<A> {
                 self.free_loc(lhs.clone());
                 self.free_loc(rhs.clone());
                 let result_reg = reg.unwrap_or_else(|| self.allocate_register());
-                // lhs > rhs: materialize as !(rhs <= lhs)
-                // Use materialize_le_s with swapped operands, then invert
-                self.arch.materialize_le_s(rhs, lhs, result_reg);
-                self.arch.emit_xori(result_reg, result_reg, 1);
+                // lhs > rhs: use materialize_gt_s
+                self.arch.materialize_gt_s(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpGeSI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_ge_s(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpEqI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_eq(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpNeI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_ne(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpLtSI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_lt_s(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpLtUI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_lt_u(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpLeUI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_le_u(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpGtUI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_gt_u(lhs, rhs, result_reg);
+                Location::Reg(result_reg)
+            }
+            Node::OpGeUI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                self.arch.materialize_ge_u(lhs, rhs, result_reg);
                 Location::Reg(result_reg)
             }
             Node::CopyFrom(Location::Stack(sloc)) => {
@@ -408,9 +470,54 @@ impl<A: arch::Architecture> CompilerState<A> {
                 self.val_stack.push(Node::OpSubI32(locs[0].clone(), locs[1].clone()));
             }
             
+            I32Eq => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpEqI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32Ne => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpNeI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32LtS => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpLtSI32(locs[0].clone(), locs[1].clone()));
+            }
+            
             I32LeS => {
                 let locs = self.materialize_args(2, None, false);
                 self.val_stack.push(Node::OpLeSI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32GtS => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpGtSI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32GeS => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpGeSI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32LtU => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpLtUI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32LeU => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpLeUI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32GtU => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpGtUI32(locs[0].clone(), locs[1].clone()));
+            }
+            
+            I32GeU => {
+                let locs = self.materialize_args(2, None, false);
+                self.val_stack.push(Node::OpGeUI32(locs[0].clone(), locs[1].clone()));
             }
             
             Drop => {
