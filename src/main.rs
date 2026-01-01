@@ -1,79 +1,5 @@
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-
-#[link(name = "c")]
-unsafe extern "C" {}
-
-use alloc::format;
-use alloc::vec::Vec;
-use core::ffi::{c_char, c_int, c_void};
+use std::fs;
 use wasmparser::{BinaryReaderError, Parser, Payload, ValType};
-
-// Global allocator using libc
-struct LibcAllocator;
-
-unsafe impl core::alloc::GlobalAlloc for LibcAllocator {
-    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        unsafe { libc::malloc(layout.size()) as *mut u8 }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
-        unsafe { libc::free(ptr as *mut c_void); }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, _layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
-        unsafe { libc::realloc(ptr as *mut c_void, new_size) as *mut u8 }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: LibcAllocator = LibcAllocator;
-
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    unsafe {
-        let msg = b"panic!\n";
-        libc::write(2, msg.as_ptr() as *const c_void, msg.len());
-        
-        // Try to print location if available
-        if let Some(location) = info.location() {
-            let loc_msg = alloc::format!(" at {}:{}:{}\n", location.file(), location.line(), location.column());
-            let bytes = loc_msg.as_bytes();
-            libc::write(2, bytes.as_ptr() as *const c_void, bytes.len());
-        }
-        
-        libc::exit(1);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_eh_personality() {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _Unwind_Resume() {}
-
-// Simple print helpers using libc
-fn print(s: &str) {
-    unsafe {
-        libc::write(1, s.as_ptr() as *const c_void, s.len());
-    }
-}
-
-fn println(s: &str) {
-    print(s);
-    print("\n");
-}
-
-fn eprint(s: &str) {
-    unsafe {
-        libc::write(2, s.as_ptr() as *const c_void, s.len());
-    }
-}
-
-fn eprintln(s: &str) {
-    eprint(s);
-    eprint("\n");
-}
 
 
 // ============================================================================
@@ -86,13 +12,13 @@ fn eprintln(s: &str) {
 //
 // Architecture:
 //   - Nodes represent unmaterialized values (constants, operations)
-//   - Locations represent materialized values (registers, stack slots, )
+//   - Locations represent materialized values (registers, stack slots, immediates)
 //   - Operand stack holds nodes
 //
 // ============================================================================
 
+mod arch;
 mod riscv;
-use riscv::Architecture;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Register(pub u8);
@@ -117,13 +43,14 @@ enum Node {
     OpAddI32(Location, Location),
     OpSubI32(Location, Location),
     OpLeSI32(Location, Location),
+    OpGtSI32(Location, Location),
     ConstI32(i32),
     CopyFrom(Location),
     Local(u32), // Local variable index (doesn't become free when used)
 }
 
-#[derive(Debug)]
-enum BlockType {
+#[derive(Debug, PartialEq, Eq)]
+enum BlockKind {
     Block,
     Loop,
     IfElse,
@@ -131,16 +58,35 @@ enum BlockType {
 
 #[derive(Debug)]
 struct BlockFrame {
-    block_type: BlockType,
-    param_locations: Vec<Location>, // needed for if-else only?
-    result_locations: Option<Vec<Location>>, // Set by first br/br_if targeting this block
-    label: u32,
-    height: u16, // Stack height at block entry
-    num_results: u8, // Number of results this block expects (from block type)
+    kind: BlockKind,
+    blockty: wasmparser::BlockType, // The actual WASM block type for type lookup
+    // registers for the target of the block, params for loop, results for block/if-else
+    target_regs: Option<Vec<Register>>,
+    label: u32, // End label for blocks/loops, if_label for if-else
+    height: u8, // Stack height at block entry, excluding block params
     polymorphic: bool, // Set to true when br/return encountered
+    if_params: Option<Vec<Node>>, // used in else to recreate val_stack
+    else_seen: bool, // For if blocks: whether Else opcode was encountered
 }
 
-struct CompilerState<A: riscv::Architecture> {
+trait BlockTypeExt {
+    fn arity(&self, types: &[(Vec<ValType>, Vec<ValType>)]) -> (u8, u8);
+}
+
+impl BlockTypeExt for wasmparser::BlockType {
+    fn arity(&self, types: &[(Vec<ValType>, Vec<ValType>)]) -> (u8, u8) {
+        match self {
+            wasmparser::BlockType::Empty => (0, 0),
+            wasmparser::BlockType::Type(_) => (0, 1),
+            wasmparser::BlockType::FuncType(idx) => {
+                let (p, r) = &types[*idx as usize];
+                (p.len() as u8, r.len() as u8)
+            }
+        }
+    }
+}
+
+struct CompilerState<A: arch::Architecture> {
     block_stack: Vec<BlockFrame>,
     val_stack: Vec<Node>,
     arch: A,
@@ -148,15 +94,17 @@ struct CompilerState<A: riscv::Architecture> {
     num_params: u8,
     num_returns: u8,
     reserved_count: u8, // Number of a0-a7 reserved for locals/params (0-8)
-    free_registers: [bool; 32], // Track all registers (x0-x31), x0 is always zero, x1 is ra, x2 is sp, x3 is gp, x4 is tp
+    free_registers: [bool; 32], // Track all registers (x0-x31), x0 is always zero, x1 is ra, x2 is sp, x3 is gp
+    types: Vec<(Vec<ValType>, Vec<ValType>)>, // Function types for lookup
+    polymorphic: bool,
 }
 
-impl<A: riscv::Architecture> CompilerState<A> {
-    fn new(arch: A) -> Self {
+impl<A: arch::Architecture> CompilerState<A> {
+    fn new(arch: A, types: Vec<(Vec<ValType>, Vec<ValType>)>) -> Self {
         let mut free_registers = [true; 32];
         // x0 (zero), x1 (ra), x2 (sp), x3 (gp) are never free
-        for i in 0..=3 {
-            free_registers[i] = false;
+        for reg in free_registers.iter_mut().take(4) {
+            *reg = false;
         }
         
         Self {
@@ -168,6 +116,33 @@ impl<A: riscv::Architecture> CompilerState<A> {
             num_returns: 0,
             reserved_count: 0,
             free_registers,
+            types,
+            polymorphic: false,
+        }
+    }
+    
+    // Parse block type to get params/results, with function type lookup
+    // NOTE: Currently unused - arity() is used instead
+    #[allow(dead_code)]
+    fn parse_block_type(&self, blockty: &wasmparser::BlockType) -> (Vec<ValType>, Vec<ValType>) {
+        match blockty {
+            wasmparser::BlockType::Empty => (Vec::<ValType>::new(), Vec::<ValType>::new()),
+            wasmparser::BlockType::Type(ty) => (Vec::<ValType>::new(), Vec::from([*ty])),
+            wasmparser::BlockType::FuncType(idx) => {
+                self.types[*idx as usize].clone()
+            }
+        }
+    }
+    
+    // Format block type for comments
+    fn format_block_type(&self, blockty: &wasmparser::BlockType) -> String {
+        match blockty {
+            wasmparser::BlockType::Empty => "[] -> []".to_string(),
+            wasmparser::BlockType::Type(ty) => format!("[] -> [{:?}]", ty),
+            wasmparser::BlockType::FuncType(idx) => {
+                let (params, results) = &self.types[*idx as usize];
+                format!("{:?} -> {:?}", params, results)
+            }
         }
     }
     
@@ -193,7 +168,7 @@ impl<A: riscv::Architecture> CompilerState<A> {
         for reg_num in candidates {
             if self.free_registers[reg_num as usize] {
                 self.free_registers[reg_num as usize] = false;
-                return Register(reg_num as u8);
+                return Register(reg_num);
             }
         }
         // TODO: Spill to stack
@@ -206,10 +181,9 @@ impl<A: riscv::Architecture> CompilerState<A> {
     
     // Free a register. Locals shouldn't be freed 
     fn free_loc(&mut self, loc: Location) {
-        if let Location::Reg(Register(reg_num)) = loc {
-            if !self.is_reserved_reg_num(reg_num) {
-                self.free_registers[reg_num as usize] = true;
-            }
+        if let Location::Reg(Register(reg_num)) = loc
+            && !self.is_reserved_reg_num(reg_num) {
+            self.free_registers[reg_num as usize] = true;
         }
         // TODO free stack slots 
     }
@@ -218,12 +192,73 @@ impl<A: riscv::Architecture> CompilerState<A> {
         self.block_stack.last_mut()
     }
     
+    // Common code for starting a block, loop, or if
+    // Returns the label that was created
+    fn start_block(&mut self, blockty: &wasmparser::BlockType, kind: BlockKind) -> u32 {
+        let (num_params, _) = blockty.arity(&self.types);
+        let type_str = self.format_block_type(blockty);
+        
+        // Emit comment with block/loop/if type
+        let kind_name = match kind {
+            BlockKind::Block => "block",
+            BlockKind::Loop => "loop",
+            BlockKind::IfElse => "if",
+        };
+        self.arch.emit(&format!("  ;; {} of type {}", kind_name, type_str));
+        
+        // Capture stack height at block entry (excluding this block params)
+        let height = self.val_stack.len() as u8 - num_params;
+
+        let mut if_params = None;
+        let mut target_regs = None;
+        if let BlockKind::Loop = kind {
+            let locs = self.materialize_args(num_params, None, true);
+            target_regs = Some(locs.iter().map(|loc| {
+                let Location::Reg(r) = loc else { panic!("unexpected non-reg in location") };
+                *r}).collect());
+            // Push param locations back onto val_stack so they're available in the loop body
+            self.val_stack.extend(locs.into_iter().map(Node::CopyFrom));
+        } else if let BlockKind::IfElse = kind {
+            if_params = Some(self.val_stack[height as usize..].to_vec());
+        }
+        
+        let label = self.block_count;
+        self.block_count += 1;
+        
+        let block_frame = BlockFrame {
+            kind,
+            blockty: *blockty,
+            target_regs,
+            label,
+            height,
+            polymorphic: false,
+            if_params,
+            else_seen: false,
+        };
+        self.block_stack.push(block_frame);
+        
+        label
+    }
+    
+    fn materialize_to_target(&mut self, relative_depth: u32) {
+        let idx = self.block_stack.len() - 1 - relative_depth as usize;
+        let (num_params, num_results) = self.block_stack[idx].blockty.arity(&self.types);
+        let npop = if let BlockKind::Loop = self.block_stack[idx].kind { num_params } else {num_results };
+        // Extract target_regs before mutable borrow
+        let target_regs: Option<Vec<Register>> = self.block_stack[idx].target_regs.clone();
+        let result_locations = self.materialize_args(npop, target_regs.as_deref(), true);
+        self.block_stack[idx].target_regs.get_or_insert(result_locations.into_iter().map(|loc| {
+            let Location::Reg(r) = loc else { panic!("Unexpected non-reg location") };
+            r
+        }).collect());
+    }
+    
     // Pop n values from val_stack, materialize them to optional registers (for ABI), and return their locations
     fn materialize_args(&mut self, n: u8, regs: Option<&[Register]>, flush2regs: bool) -> Vec<Location> {
         let len = self.val_stack.len();
         let n_usize = n as usize;
         assert!(n_usize <= len, "materialize_args: trying to pop {} values but stack only has {}", n, len);
-        let mut stack = core::mem::take(&mut self.val_stack);
+        let mut stack = std::mem::take(&mut self.val_stack);
         let result = stack.drain(len - n_usize..)
             .enumerate()
             .map(|(i, node)| {
@@ -272,6 +307,16 @@ impl<A: riscv::Architecture> CompilerState<A> {
                 self.arch.materialize_le_s(lhs, rhs, result_reg);
                 Location::Reg(result_reg)
             }
+            Node::OpGtSI32(lhs, rhs) => {
+                self.free_loc(lhs.clone());
+                self.free_loc(rhs.clone());
+                let result_reg = reg.unwrap_or_else(|| self.allocate_register());
+                // lhs > rhs: materialize as !(rhs <= lhs)
+                // Use materialize_le_s with swapped operands, then invert
+                self.arch.materialize_le_s(rhs, lhs, result_reg);
+                self.arch.emit_xori(result_reg, result_reg, 1);
+                Location::Reg(result_reg)
+            }
             Node::CopyFrom(Location::Stack(sloc)) => {
                 let reg = reg.unwrap_or_else(|| self.allocate_register());
                 self.arch.emit_load_word(reg, *sloc);
@@ -306,7 +351,9 @@ impl<A: riscv::Architecture> CompilerState<A> {
         use wasmparser::Operator::*;
         
         // If current block is polymorphic, ignore all operators except End
-        if self.block_stack.last().map_or(false, |b| b.polymorphic) && !matches!(op, wasmparser::Operator::End) {
+        // TODO: pass continuation and drop until End in a loop to speed up
+        if self.polymorphic ||
+           (self.block_stack.last().is_some_and(|b| b.polymorphic) && !matches!(op, wasmparser::Operator::End)) {
             return Ok(());
         }
         
@@ -346,12 +393,8 @@ impl<A: riscv::Architecture> CompilerState<A> {
                 // If original node is a constant, push it back (keeps it as constant)
                 // Otherwise, push CopyFrom(loc) to reference the materialized location
                 match &node {
-                    Node::ConstI32(_) => {
-                        self.val_stack.push(node);
-                    }
-                    _ => {
-                        self.val_stack.push(Node::CopyFrom(loc));
-                    }
+                    Node::ConstI32(_) => self.val_stack.push(node),
+                    _ => self.val_stack.push(Node::CopyFrom(loc)),
                 }
             }
             
@@ -370,166 +413,171 @@ impl<A: riscv::Architecture> CompilerState<A> {
                 self.val_stack.push(Node::OpLeSI32(locs[0].clone(), locs[1].clone()));
             }
             
-            Block { blockty: _blockty } => {
-                // Parse block type to get params/results
-                let (params, results) = match _blockty {
-                    wasmparser::BlockType::Empty => (Vec::<ValType>::new(), Vec::<ValType>::new()),
-                    wasmparser::BlockType::Type(ty) => (Vec::<ValType>::new(), Vec::from([*ty])),
-                    wasmparser::BlockType::FuncType(_idx) => {
-                        // TODO: Look up function type
-                        (Vec::<ValType>::new(), Vec::<ValType>::new())
-                    }
-                };
-                
-                // Capture stack height at block entry (before popping params)
-                let height = self.val_stack.len() as u16;
-                
-                // Materialize block parameters
-                let param_locations = self.materialize_args(params.len() as u8, None, false);
-                
-                // Result locations will be set by first br/br_if targeting this block
-                let num_results = results.len() as u8;
-                
-                let label = self.block_count;
-                self.block_count += 1;
-                
-                let block_frame = BlockFrame {
-                    block_type: BlockType::Block,
-                    param_locations,
-                    result_locations: None,
-                    num_results,
-                    label,
-                    height,
-                    polymorphic: false,
-                };
-                self.block_stack.push(block_frame);
+            Drop => {
+                let node = self.val_stack.pop().unwrap();
+                // Materialize it to free any registers it might be using
+                self.materialize(&node, None, false);
             }
             
-            Loop { blockty: _blockty } => {
-                unimplemented!("Loop blocks")
+            Block { blockty } => {
+                self.start_block(blockty, BlockKind::Block);
             }
             
-            If { blockty: _blockty } => {
-                unimplemented!("If blocks")
+            Loop { blockty } => {
+                let label = self.start_block(blockty, BlockKind::Loop);
+                // For loop, emit label at start
+                self.arch.emit(&format!("{}:", self.arch.format_label(label)));
+            }
+            
+            If { blockty } => {
+                // Pop condition (don't materialize yet - try pattern matching first)
+                let cond_node = self.val_stack.pop().unwrap();
+                
+                let end_label = self.start_block(blockty, BlockKind::IfElse);
+
+                // Generate else label from end_label with suffix
+                let else_label_str = format!("{}_else", self.arch.format_label(end_label));
+                
+                // If condition is false, jump to else label (invert=true)
+                if self.arch.emit_conditional_branch(&cond_node, &else_label_str, true).is_err() {
+                    // Pattern matching failed, materialize (flush to regs) and use beqz
+                    let Location::Reg(cond_reg) = self.materialize(&cond_node, None, true) else {
+                        panic!("Unexpected non-reg in loc");
+                    };
+                    self.arch.emit_beqz_str(cond_reg, &else_label_str);
+                }
             }
             
             Else => {
-                unimplemented!("Else branches")
+                // Get the current if block
+                self.materialize_to_target(0);
+
+                let mut block = self.block_stack.pop().unwrap();
+                
+                // Emit jump to end label (end of if branch)
+                self.arch.emit_jump(block.label);
+                
+                // Emit else label (generated from end_label with suffix)
+                let else_label_str = format!("{}_else:", self.arch.format_label(block.label));
+                self.arch.emit(&else_label_str);
+                
+                // Reset block state:
+                block.polymorphic = false;
+                block.else_seen = true; // Mark that Else was encountered
+                self.val_stack.truncate(block.height as usize);
+                self.val_stack.extend(block.if_params.take().unwrap());
+                self.block_stack.push(block)
             }
             
             End => {
                 // If block_stack is empty, this END is ending the function body
                 if self.block_stack.is_empty() {
                     // Function end - materialize any remaining results to ABI return locations
-                    let num_results = self.num_returns.min(self.val_stack.len() as u8);
-                    let abi_regs: Vec<Register> = (0..num_results as usize)
+                    let abi_regs: Vec<Register> = (0..self.num_returns as usize)
                         .filter_map(|i| self.arch.abi_register(i))
                         .collect();
-                    let results = self.materialize_args(num_results, Some(&abi_regs), false);
-                    self.arch.materialize_return(&results, num_results);
+                    self.materialize_args(self.num_returns, Some(&abi_regs), false);
+                    self.arch.emit_return();
                     return Ok(());
                 }
                 
                 // Otherwise, this END is ending a block
                 let block = self.block_stack.pop().unwrap();
-                let num_params = block.param_locations.len();
-                let num_results = block.num_results;
-                let label = block.label;
+                let (_num_params, num_results) = block.blockty.arity(&self.types);
+                let BlockFrame { kind, target_regs: existing_result_locations, label, height, polymorphic, else_seen, .. } = block;
                 
-                if block.polymorphic {
-                    // Polymorphic block: drop to (height - num_params) to restore stack to state after params were popped
+                // For if blocks without else, emit the else label (if condition was false, we jump here)
+                if kind == BlockKind::IfElse && !else_seen {
+                    let else_label_str = format!("{}_else:", self.arch.format_label(label));
+                    self.arch.emit(&else_label_str);
+                }
+                
+                if polymorphic {
+                    // Polymorphic block: drop to height to restore stack to state after params were popped
                     // Then push result locations for parent block consumption
-                    // Final stack height should be: (height - num_params) + num_results
-                    let target_height = (block.height as usize) - num_params;
+                    // Final stack height should be: height + num_results
+                    let target_height = height as usize;
                     let current_height = self.val_stack.len();
                     assert!(current_height >= target_height, 
-                        "End polymorphic block: stack height {} < target height {} (entry height {} - {} params)", 
-                        current_height, target_height, block.height, num_params);
+                        "End polymorphic block: stack height {} < target height {} (entry height {})", 
+                        current_height, target_height, height);
                     // Drop to target_height (stack state after params were popped)
                     self.val_stack.truncate(target_height);
                     
+                    // this END is unreachable, mark its parent polymorphic (if there is a parent)
+                    if existing_result_locations.is_none() && let Some(b) = self.current_block() {
+                        b.polymorphic = true;
+                    }
+
                     // Push result locations for parent block
-                    if let Some(ref result_locations) = block.result_locations {
-                        self.val_stack.extend(result_locations.iter().map(|loc| Node::CopyFrom(loc.clone())));
-                    } else {
-                        // this END is unreachable, mark its parent polymorphic (if there is a parent)
-                        self.current_block().map(|b| b.polymorphic = true);
+                    if let Some(regs) = existing_result_locations {
+                        self.val_stack.extend(regs.into_iter().map(|r| Node::CopyFrom(Location::Reg(r))));
                     }
                 } else {
-                    // Normal block: materialize results from val_stack (force materialize constants at block boundary)
-                    let result_locations = self.materialize_args(num_results, None, true);
+                    // Normal block: materialize results from val_stack
+                    let result_locations = self.materialize_args(num_results, existing_result_locations.as_deref(), true);
                     
                     // Push results onto parent block's val_stack
                     self.val_stack.extend(result_locations.into_iter().map(Node::CopyFrom));
                 }
                 
-                // Emit block label at end (target for jumps)
-                self.arch.emit(&format!("{}:", self.arch.format_label(label)));
+                // Emit block label at end (target for jumps) - but not for loops (label is at start)
+                if kind != BlockKind::Loop {
+                    self.arch.emit(&format!("{}:", self.arch.format_label(label)));
+                }
             }
             
             Br { relative_depth } => {
                 let target_idx = self.block_stack.len() - 1 - *relative_depth as usize;
-                let num_results = self.block_stack[target_idx].num_results;
                 let target_label = self.block_stack[target_idx].label;
+                self.materialize_to_target(*relative_depth);
                 
-                let regs: Option<Vec<Register>> = self.block_stack[target_idx].result_locations.as_ref()
-                    .map(|locs| locs.iter().map(|loc| {
-                        let Location::Reg(reg) = loc else { panic!("non-reg in br target loc"); };
-                        *reg
-                    }).collect());
-                let result_locations = self.materialize_args(num_results, regs.as_deref(), true);
-                self.block_stack[target_idx].result_locations.get_or_insert(result_locations);
-                
-                self.current_block().map(|b| b.polymorphic = true);
-                
-                // Emit jump to label
+                if let Some(b) = self.current_block() {
+                    b.polymorphic = true;
+                }
                 self.arch.emit_jump(target_label);
             }
             
             BrIf { relative_depth } => {
-                // Pop and materialize condition
+                // Pop condition (don't materialize yet - try pattern matching first)
                 let cond_node = self.val_stack.pop().unwrap();
-                let cond_loc = self.materialize(&cond_node, None, false);
                 
                 let target_idx = self.block_stack.len() - 1 - *relative_depth as usize;
-                let num_results = self.block_stack[target_idx].num_results;
                 let target_label = self.block_stack[target_idx].label;
+                self.materialize_to_target(*relative_depth);
                 
-                // Extract registers from existing_locations if present (by reference)
-                let regs: Option<Vec<Register>> = self.block_stack[target_idx].result_locations.as_ref()
-                    .map(|locs| locs.iter().map(|loc| {
-                        let Location::Reg(reg) = loc else { panic!("non-reg in br_if target loc"); };
-                        *reg
-                    }).collect());
-                
-                // Materialize results (pops from stack)
-                let result_locations = self.materialize_args(num_results, regs.as_deref(), true);
-
                 // Push values back onto stack (they stay if condition is false)
-                self.val_stack.extend(result_locations.iter().rev().map(|loc| Node::CopyFrom(loc.clone())));
-
-                // Update result_locations only if not already set
-                self.block_stack[target_idx].result_locations.get_or_insert(result_locations);
+                // Extract target_regs before extending to avoid borrow conflicts
+                let target_regs: Vec<Register> = self.block_stack[target_idx].target_regs.as_ref().unwrap().to_vec();
+                self.val_stack.extend(target_regs.iter().map(|r| Node::CopyFrom(Location::Reg(*r))));
                 
-                // Emit conditional branch: if cond_loc != 0, jump to target_label
-                if let Location::Reg(cond_reg) = cond_loc {
-                    self.arch.emit_bnez(cond_reg, target_label);
-                } else {
-                    // TODO: Handle immediate condition
-                    self.arch.emit("  ;; TODO: br_if with immediate condition");
+                // Emit conditional branch: if cond != 0, jump to target_label (invert=false)
+                let target_label_str = self.arch.format_label(target_label);
+                if self.arch.emit_conditional_branch(&cond_node, &target_label_str, false).is_err() {
+                    // Pattern matching failed, materialize (flush to regs) and use bnez
+                    let cond_loc = self.materialize(&cond_node, None, true);
+                    if let Location::Reg(cond_reg) = cond_loc {
+                        self.arch.emit_bnez(cond_reg, target_label);
+                    } else {
+                        // Shouldn't happen if flush=true, but handle it
+                        panic!("Condition materialized to non-register");
+                    }
                 }
             }
             
             Return => {
-                self.current_block().map(|b| b.polymorphic = true);
+                if let Some(b) = self.current_block() {
+                    b.polymorphic = true;
+                } else {
+                    self.polymorphic = true;
+                }
                 
                 // Materialize only the return values (not all values on stack)
-                let num_results = self.num_returns.min(self.val_stack.len() as u8);
-                let abi_regs: Vec<Register> = (0..num_results as usize)
+                let abi_regs: Vec<Register> = (0..self.num_returns as usize)
                     .filter_map(|i| self.arch.abi_register(i))
                     .collect();
-                let results = self.materialize_args(num_results, Some(&abi_regs), true);
-                self.arch.materialize_return(&results, num_results);
+                self.materialize_args(self.num_returns, Some(&abi_regs), true);
+                self.arch.emit_return();
             }
             
             Call { function_index } => {
@@ -560,8 +608,6 @@ impl<A: riscv::Architecture> CompilerState<A> {
         // Store number of return values
         self.num_returns = return_types.len().min(8) as u8;
         
-        println(&format!("  ;; Function with {} params, {} total params+locals", param_types.len(), num_params));
-        
         // Compile operators
         let ops_reader = body.get_operators_reader()?;
         for op in ops_reader {
@@ -589,13 +635,10 @@ fn compile_wasm(bytes: &[u8]) -> Result<(), BinaryReaderError> {
                 for rec_group in reader.into_iter() {
                     let rec_group = rec_group?;
                     for subtype in rec_group.types() {
-                        match &subtype.composite_type.inner {
-                            wasmparser::CompositeInnerType::Func(func_type) => {
-                                let params: Vec<ValType> = func_type.params().iter().copied().collect();
-                                let results: Vec<ValType> = func_type.results().iter().copied().collect();
-                                types.push((params, results));
-                            }
-                            _ => {}
+                        if let wasmparser::CompositeInnerType::Func(func_type) = &subtype.composite_type.inner {
+                            let params: Vec<ValType> = func_type.params().to_vec();
+                            let results: Vec<ValType> = func_type.results().to_vec();
+                            types.push((params, results));
                         }
                     }
                 }
@@ -610,20 +653,21 @@ fn compile_wasm(bytes: &[u8]) -> Result<(), BinaryReaderError> {
                 current_func_idx = 0;
             }
             Payload::CodeSectionEntry(body) => {
-                let func_type_idx = function_types.get(current_func_idx);
-                let func_type_info = func_type_idx.and_then(|&idx| types.get(idx as usize));
+                let func_type_idx = function_types[current_func_idx];
+                let (param_types, return_types) = &types[func_type_idx as usize];
                 
                 let arch = riscv::RiscV::new();
-                let mut compiler = CompilerState::new(arch);
-                Architecture::emit(&mut compiler.arch, &format!("  ;; Function {} (type_idx: {:?})", current_func_idx, func_type_idx));
+                let mut compiler = CompilerState::new(arch, types.clone());
                 
-                let param_types = func_type_info.map(|(params, _)| params.as_slice()).unwrap_or(&[]);
-                let return_types = func_type_info.map(|(_, results)| results.as_slice()).unwrap_or(&[]);
-                compiler.compile_function(&body, param_types, return_types)?;
+                // Format function type for comment
+                let type_str = format!("{:?} -> {:?}", param_types, return_types);
+                arch::Architecture::emit(&mut compiler.arch, &format!("  ;; Function {} of type {}", current_func_idx, type_str));
+                
+                compiler.compile_function(&body, param_types.as_slice(), return_types.as_slice())?;
                 
                 // Print assembly output
-                let output = core::mem::replace(&mut compiler.arch, riscv::RiscV::new()).into_output();
-                print(&output);
+                let output = std::mem::replace(&mut compiler.arch, riscv::RiscV::new()).into_output();
+                print!("{}", output);
                 
                 current_func_idx += 1;
             }
@@ -635,59 +679,23 @@ fn compile_wasm(bytes: &[u8]) -> Result<(), BinaryReaderError> {
 }
 
 
-fn read_file(path: *const c_char) -> Option<Vec<u8>> {
-    unsafe {
-        let fd = libc::open(path, libc::O_RDONLY);
-        if fd < 0 {
-            return None;
-        }
-
-        let mut stat: libc::stat = core::mem::zeroed();
-        if libc::fstat(fd, &mut stat) < 0 {
-            libc::close(fd);
-            return None;
-        }
-
-        let size = stat.st_size as usize;
-        let mut buf = Vec::with_capacity(size);
-        buf.set_len(size);
-
-        let n = libc::read(fd, buf.as_mut_ptr() as *mut c_void, size);
-        libc::close(fd);
-
-        if n < 0 || n as usize != size {
-            return None;
-        }
-
-        Some(buf)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
-    if argc != 2 {
-        eprintln("Usage: qwac <wasm-file>");
-        return 1;
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: qwac <wasm-file>");
+        std::process::exit(1);
     }
 
-    let filename = unsafe { *argv.offset(1) };
-    let bytes = match read_file(filename) {
-        Some(b) => b,
-        None => {
-            eprint("Error reading file: ");
-            unsafe {
-                let len = libc::strlen(filename);
-                libc::write(2, filename as *const c_void, len);
-            }
-            eprintln("");
-            return 1;
+    let bytes = match fs::read(&args[1]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error reading file {}: {}", args[1], e);
+            std::process::exit(1);
         }
     };
 
     if let Err(_e) = compile_wasm(&bytes) {
-        eprintln("Error compiling wasm");
-        return 1;
+        eprintln!("Error compiling wasm");
+        std::process::exit(1);
     }
-
-    0
 }

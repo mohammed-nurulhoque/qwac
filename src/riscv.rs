@@ -1,39 +1,5 @@
-use alloc::format;
-use alloc::string::String;
-use crate::{Location, Register, Const};
-
-pub trait Architecture {
-    fn emit(&mut self, line: &str);
-    
-    // Register operations
-    fn register_name(&self, reg: Register) -> String;
-    fn abi_register(&self, idx: usize) -> Option<Register>;
-    
-    // Instruction generation
-    fn emit_load_immediate(&mut self, reg: Register, value: i32);
-    fn emit_move(&mut self, dst: Register, src: Register);
-    fn emit_load_word(&mut self, reg: Register, offset: i32);
-    fn emit_store_word(&mut self, reg: Register, offset: i32);
-    fn emit_add(&mut self, dst: Register, src1: Register, src2: Register);
-    fn emit_add_immediate(&mut self, dst: Register, src: Register, imm: i32);
-    fn emit_sub(&mut self, dst: Register, src1: Register, src2: Register);
-    fn emit_slt(&mut self, dst: Register, src1: Register, src2: Register);
-    fn emit_slti(&mut self, dst: Register, src: Register, imm: i32);
-    fn emit_xori(&mut self, dst: Register, src: Register, imm: i32);
-    fn emit_bnez(&mut self, reg: Register, label: u32);
-    fn emit_jump(&mut self, label: u32);
-    fn emit_return(&mut self);
-    
-    // Label generation
-    fn format_label(&self, label: u32) -> String;
-    
-    // Materialization helpers
-    fn materialize_add(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
-    fn materialize_sub(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
-    fn materialize_le_s(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
-    fn materialize_store_local(&mut self, local_idx: u32, loc: &Location);
-    fn materialize_return(&mut self, results: &[Location], num_returns: u8);
-}
+use crate::{Location, Register, Const, Node};
+use crate::arch::Architecture;
 
 pub struct RiscV {
     output: String,
@@ -111,6 +77,30 @@ impl Architecture for RiscV {
     
     fn emit_bnez(&mut self, reg: Register, label: u32) {
         self.emit(&format!("  bnez {}, {}", self.register_name(reg), self.format_label(label)));
+    }
+    
+    fn emit_beqz(&mut self, reg: Register, label: u32) {
+        self.emit(&format!("  beqz {}, {}", self.register_name(reg), self.format_label(label)));
+    }
+    
+    fn emit_beqz_str(&mut self, reg: Register, label: &str) {
+        self.emit(&format!("  beqz {}, {}", self.register_name(reg), label));
+    }
+    
+    fn emit_beq(&mut self, reg1: Register, reg2: Register, label: &str) {
+        self.emit(&format!("  beq {}, {}, {}", self.register_name(reg1), self.register_name(reg2), label));
+    }
+    
+    fn emit_bne(&mut self, reg1: Register, reg2: Register, label: &str) {
+        self.emit(&format!("  bne {}, {}, {}", self.register_name(reg1), self.register_name(reg2), label));
+    }
+    
+    fn emit_blt(&mut self, reg1: Register, reg2: Register, label: &str) {
+        self.emit(&format!("  blt {}, {}, {}", self.register_name(reg1), self.register_name(reg2), label));
+    }
+    
+    fn emit_bge(&mut self, reg1: Register, reg2: Register, label: &str) {
+        self.emit(&format!("  bge {}, {}, {}", self.register_name(reg1), self.register_name(reg2), label));
     }
     
     fn emit_jump(&mut self, label: u32) {
@@ -211,25 +201,33 @@ impl Architecture for RiscV {
         }
     }
     
-    fn materialize_return(&mut self, results: &[Location], num_returns: u8) {
-        let num_results = num_returns.min(results.len() as u8);
-        for i in 0..num_results as usize {
-            if let Some(abi_reg) = self.abi_register(i) {
-                match &results[i] {
-                    Location::Reg(src_reg) => {
-                        if abi_reg != *src_reg {
-                            self.emit_move(abi_reg, *src_reg);
-                        }
-                    }
-                    Location::Immediate(Const::I32(val)) => {
-                        self.emit_load_immediate(abi_reg, *val);
-                    }
-                    _ => {
-                        self.emit(&format!("  ;; TODO: function return {:?}", results[i]));
-                    }
-                }
+    fn emit_conditional_branch(&mut self, cond: &Node, label: &str, invert: bool) -> Result<(), ()> {
+        // invert node if needed
+        let inverted = match cond {
+            Node::OpLeSI32(lhs, rhs) => Node::OpGtSI32(lhs.clone(), rhs.clone()),
+            Node::OpGtSI32(lhs, rhs) => Node::OpLeSI32(lhs.clone(), rhs.clone()),
+            Node::ConstI32(n) => Node::ConstI32(!n),
+            _ => return Err(())
+        };
+        
+        match if invert { &inverted } else { cond } {
+            Node::OpLeSI32(Location::Reg(lhs_reg), Location::Reg(rhs_reg)) => {
+                self.emit_bge(*rhs_reg, *lhs_reg, label);
+                Ok(())
             }
+            Node::OpGtSI32(Location::Reg(lhs_reg), Location::Reg(rhs_reg)) => {
+                self.emit_blt(*rhs_reg, *lhs_reg, label);
+                Ok(())
+            }
+            Node::ConstI32(val) => {
+                // Constant condition: if non-zero, jump to label
+                if *val != 0 {
+                    self.emit(&format!("  j {}", label));
+                }
+                // If zero, fall through (don't jump)
+                Ok(())
+            }
+            _ => Err(()) // Can't pattern match, needs materialization
         }
-        self.emit_return();
     }
 }

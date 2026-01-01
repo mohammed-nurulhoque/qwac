@@ -5,14 +5,4 @@ edition = "2024"
 
 [dependencies]
 wasmparser = { version = "0.243.0", default-features = false }
-libc = "0.2"
 
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true

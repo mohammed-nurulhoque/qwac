@@ -1,0 +1,12 @@
+(module
+  (func (export "test") (param i32) (result i32)
+    (i32.const 1)
+    (block (result i32)
+      (i32.const 2)
+      (local.get 0)
+      (br_if 0)
+      (i32.const 3)
+      (i32.add)
+    )
+  )
+)
