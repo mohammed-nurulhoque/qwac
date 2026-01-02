@@ -14,4 +14,5 @@ val_stack presumably), and tries to combine them, returning Option<Node>. e.g.
 i32Eq with [OpLtSI32(n, m), Const(0)] would return Some(OpGeSI32(n, m)). If no
 simplifications are found, return none. In materialize args, before
 materializing arguments, call this function to see if simplifications are
-possible.
+possible. If some(node) is returned, push node to the stack, otherwise,
+materialize and push new node as is now.

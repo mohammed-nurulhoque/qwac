@@ -18,6 +18,7 @@ use wasmparser::{BinaryReaderError, Parser, Payload, ValType};
 // ============================================================================
 
 mod arch;
+mod optimize;
 mod riscv;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,11 +472,31 @@ impl<A: arch::Architecture> CompilerState<A> {
             }
             
             I32Eq => {
+                let len = self.val_stack.len();
+                if len >= 2 {
+                    let args = &self.val_stack[len - 2..];
+                    if let Some(combined) = optimize::combine(op, args) {
+                        self.val_stack.pop();
+                        self.val_stack.pop();
+                        self.val_stack.push(combined);
+                        return Ok(());
+                    }
+                }
                 let locs = self.materialize_args(2, None, false);
                 self.val_stack.push(Node::OpEqI32(locs[0].clone(), locs[1].clone()));
             }
             
             I32Ne => {
+                let len = self.val_stack.len();
+                if len >= 2 {
+                    let args = &self.val_stack[len - 2..];
+                    if let Some(combined) = optimize::combine(op, args) {
+                        self.val_stack.pop();
+                        self.val_stack.pop();
+                        self.val_stack.push(combined);
+                        return Ok(());
+                    }
+                }
                 let locs = self.materialize_args(2, None, false);
                 self.val_stack.push(Node::OpNeI32(locs[0].clone(), locs[1].clone()));
             }
