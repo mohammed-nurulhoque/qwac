@@ -1,14 +1,26 @@
 use crate::{Location, Register, Const, Node};
-use crate::arch::Architecture;
+use crate::FnInfo;
+use crate::target::Backend;
 
 pub struct RiscV {
+    reserved_count: u8, // Number of a0-a7 reserved for locals/params (0-8)
+    free_registers: [bool; 32], // Track all registers (x0-x31), x0 is always zero, x1 is ra, x2 is sp, x3 is gp
     output: String,
+    xlen: i32, // XLEN in bits (32 for RV32, 64 for RV64)
 }
 
 impl RiscV {
-    pub fn new() -> Self {
+    pub fn new(xlen: i32) -> Self {
+        let mut free_registers = [true; 32];
+        // x0 (zero), x1 (ra), x2 (sp), x3 (gp) are never free
+        for reg in free_registers.iter_mut().take(4) {
+            *reg = false;
+        }
         Self {
+            reserved_count: 0,
+            free_registers,
             output: String::new(),
+            xlen,
         }
     }
     
@@ -17,24 +29,82 @@ impl RiscV {
     }
 }
 
-impl Architecture for RiscV {
+impl Backend for RiscV {
     fn emit(&mut self, line: &str) {
         self.output.push_str(line);
         self.output.push('\n');
+    }
+
+    // Initialize register allocator: reserve a0-a7 for params/locals (up to 8)
+    // TODO only reserve non-param locals on first def.
+    fn init_registers(&mut self, info: &FnInfo) {
+        self.reserved_count = (info.num_params as u32 + info.num_locals).min(8) as u8;
+        for i in 0..self.reserved_count {
+            self.free_registers[10 + i as usize] = false; // a0-a7 = x10-x17
+        }
+        }
+        
+    // Allocate the next free register (any register except reserved ones)
+    fn allocate_register(&mut self) -> Register {
+        // Try registers in order: temp (t0-t6), unreserved args (a0-a7), saved (s0-s11)
+        let candidates = (5..=7)           // t0-t2 (x5-x7)
+            .chain(28..=31)                // t3-t6 (x28-x31)
+            .chain((self.reserved_count..8).map(|i| 10 + i)) // Unreserved a0-a7
+            .chain(8..=9)                  // s0-s1 (x8-x9)
+            .chain(18..=27);               // s2-s11 (x18-x27)
+        
+        for reg_num in candidates {
+            if self.free_registers[reg_num as usize] {
+                self.free_registers[reg_num as usize] = false;
+                return Register(reg_num);
+            }
+        }
+        // TODO: Spill to stack
+        unimplemented!("Out of registers, spilling not implemented yet");
+    }
+    
+    // Free a register. Locals shouldn't be freed 
+    fn free_loc(&mut self, loc: Location) {
+        if let Location::Reg(Register(reg_num)) = loc {
+            let reserved = reg_num >= 10 && ((reg_num - 10) as usize) < self.reserved_count as usize;
+            if !reserved {
+                self.free_registers[reg_num as usize] = true;
+            }
+        }
+        // TODO free stack slots 
     }
     
     fn register_name(&self, reg: Register) -> String {
         format!("x{}", reg.0)
     }
     
-    fn abi_register(&self, idx: usize) -> Option<Register> {
+    fn get_local_register(&self, info: &FnInfo, idx: u32) -> Option<Register> {
         if idx < 8 {
             Some(Register(10 + idx as u8)) // a0-a7 = x10-x17
         } else {
             None
         }
     }
+
+    fn get_local_offset(&self, info: &FnInfo, idx: u32) -> Option<i32> {
+        let reg_count = (info.num_params as u32 + info.num_locals).min(8);
+        if idx < reg_count {
+            None
+        } else if idx < info.num_params as u32 {
+            // Param on stack, positive offset
+            Some((idx - reg_count) as i32 * self.xlen)
+        } else {
+            // Local on stack, negative offset
+            Some(-((idx - reg_count.max(info.num_params as u32) + 1) as i32 * self.xlen))
+        }
+    }
     
+    fn get_local_location(&self, info: &FnInfo, idx: u32) -> Option<Location> {
+        self.get_local_register(info, idx).map(Location::Reg).or_else(|| {
+            self.get_local_offset(info, idx).map(Location::Stack)
+        })
+    }
+
     fn emit_load_immediate(&mut self, reg: Register, value: i32) {
         self.emit(&format!("  li {}, {}", self.register_name(reg), value));
     }
@@ -146,7 +216,7 @@ impl Architecture for RiscV {
                 self.emit_load_immediate(result_reg, lhs_val + rhs_val);
             }
             _ => {
-                self.emit(&format!("  ;; TODO: add {:?} + {:?}", lhs, rhs));
+                unimplemented!("  ;; TODO: add {:?} + {:?}", lhs, rhs);
             }
         }
     }
@@ -167,7 +237,7 @@ impl Architecture for RiscV {
                 self.emit_load_immediate(result_reg, lhs_val - rhs_val);
             }
             _ => {
-                self.emit(&format!("  ;; TODO: sub {:?} - {:?}", lhs, rhs));
+                unimplemented!("  ;; TODO: sub {:?} - {:?}", lhs, rhs);
             }
         }
     }
@@ -220,7 +290,7 @@ impl Architecture for RiscV {
                 self.emit_load_immediate(result_reg, if lhs_val == rhs_val { 1 } else { 0 });
             }
             _ => {
-                self.emit(&format!("  ;; TODO: eq {:?} == {:?}", lhs, rhs));
+                unimplemented!("  ;; TODO: eq {:?} == {:?}", lhs, rhs);
             }
         }
     }
@@ -249,7 +319,7 @@ impl Architecture for RiscV {
                 self.emit_load_immediate(result_reg, if lhs_val < rhs_val { 1 } else { 0 });
             }
             _ => {
-                self.emit(&format!("  ;; TODO: lt_s {:?} < {:?}", lhs, rhs));
+                unimplemented!("  ;; TODO: lt_s {:?} < {:?}", lhs, rhs);
             }
         }
     }
@@ -276,7 +346,7 @@ impl Architecture for RiscV {
                 self.emit_load_immediate(result_reg, if lhs_val <= rhs_val { 1 } else { 0 });
             }
             _ => {
-                self.emit(&format!("  ;; TODO: le_s {:?} <= {:?}", lhs, rhs));
+                unimplemented!("  ;; TODO: le_s {:?} <= {:?}", lhs, rhs);
             }
         }
     }
@@ -309,7 +379,7 @@ impl Architecture for RiscV {
                 self.emit_load_immediate(result_reg, if (*lhs_val as u32) < (*rhs_val as u32) { 1 } else { 0 });
             }
             _ => {
-                self.emit(&format!("  ;; TODO: lt_u {:?} < {:?}", lhs, rhs));
+                unimplemented!("  ;; TODO: lt_u {:?} < {:?}", lhs, rhs);
             }
         }
     }
@@ -333,7 +403,7 @@ impl Architecture for RiscV {
                 self.emit_load_immediate(result_reg, if (*lhs_val as u32) <= (*rhs_val as u32) { 1 } else { 0 });
             }
             _ => {
-                self.emit(&format!("  ;; TODO: le_u {:?} <= {:?}", lhs, rhs));
+                unimplemented!("  ;; TODO: le_u {:?} <= {:?}", lhs, rhs);
             }
         }
     }
@@ -349,19 +419,34 @@ impl Architecture for RiscV {
         self.materialize_le_u(rhs, lhs, result_reg);
     }
     
-    fn materialize_store_local(&mut self, local_idx: u32, loc: &Location) {
-        if local_idx >= 8 {
-            let stack_offset = -((local_idx * 4) as i32);
+    fn materialize_store_local(&mut self, info: &FnInfo, local_idx: u32, loc: &Location) {
+        if let Some(stack_offset) = self.get_local_offset(info, local_idx) {
             match loc {
                 Location::Reg(reg) => {
                     self.emit_store_word(*reg, stack_offset);
                 }
                 Location::Immediate(Const::I32(val)) => {
-                    // Need to materialize to temp register first
-                    self.emit(&format!("  ;; TODO: store immediate {} to local {}", val, local_idx));
+                    let temp = self.allocate_register();
+                    self.emit_load_immediate(temp, *val);
+                    self.emit_store_word(temp, stack_offset);
+                    self.free_loc(Location::Reg(temp));
                 }
                 _ => {
-                    self.emit(&format!("  ;; TODO: store {:?} to local {}", loc, local_idx));
+                    unimplemented!("  ;; TODO: store {:?} to local {}", loc, local_idx);
+                }
+            }
+        } else {
+            // In register
+            let reg = self.get_local_register(info, local_idx).unwrap();
+            match loc {
+                Location::Reg(src_reg) => {
+                    self.emit_move(reg, *src_reg);
+                }
+                Location::Immediate(Const::I32(val)) => {
+                    self.emit_load_immediate(reg, *val);
+                }
+                _ => {
+                    unimplemented!("  ;; TODO: store {:?} to local {}", loc, local_idx);
                 }
             }
         }

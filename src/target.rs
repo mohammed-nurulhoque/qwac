@@ -1,13 +1,22 @@
 use crate::{Location, Register, Node};
+use crate::FnInfo;
 
-pub trait Architecture {
+pub trait Backend {
     fn emit(&mut self, line: &str);
+
+    fn init_registers(&mut self, info: &FnInfo);
+    fn allocate_register(&mut self) -> Register;
+    fn free_loc(&mut self, loc: Location);
+
     
     // Register operations
     fn register_name(&self, reg: Register) -> String;
-    fn abi_register(&self, idx: usize) -> Option<Register>;
+    fn get_local_register(&self, info: &FnInfo, idx: u32) -> Option<Register>;
+    fn get_local_offset(&self, info: &FnInfo, idx: u32) -> Option<i32>;
+    fn get_local_location(&self, info: &FnInfo, idx: u32) -> Option<Location>;
     
     // Instruction generation
+    // TODO: generalize. This is too RISC-V specific.
     fn emit_load_immediate(&mut self, reg: Register, value: i32);
     fn emit_move(&mut self, dst: Register, src: Register);
     fn emit_load_word(&mut self, reg: Register, offset: i32);
@@ -48,7 +57,7 @@ pub trait Architecture {
     fn materialize_le_u(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
     fn materialize_gt_u(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
     fn materialize_ge_u(&mut self, lhs: &Location, rhs: &Location, result_reg: Register);
-    fn materialize_store_local(&mut self, local_idx: u32, loc: &Location);
+    fn materialize_store_local(&mut self, info: &FnInfo, local_idx: u32, loc: &Location);
     
     // Conditional branch: emit appropriate branch based on condition node
     // If condition is true (non-zero), jump to label
